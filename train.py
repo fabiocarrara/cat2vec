@@ -10,6 +10,7 @@ import torch.utils.data
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
+from pprint import pformat
 from tqdm import tqdm, trange
 
 # Available PyTorch models for ImageNet
@@ -21,7 +22,9 @@ model_names = sorted(name for name in models.__dict__
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        base_dir = os.path.dirname(filename)
+        best_filename = os.path.join(base_dir, 'model_best.pth.tar')
+        shutil.copyfile(filename, best_filename)
 
 
 def train(data, model, criterion, optimizer, epoch, args):
@@ -40,7 +43,7 @@ def train(data, model, criterion, optimizer, epoch, args):
         # forward and backward pass
         optimizer.zero_grad()
         Y_hat = model(X)
-        loss = criterion(Y, Y_hat).mean()
+        loss = - criterion(Y, Y_hat).mean()
         loss.backward()
         optimizer.step()
 
@@ -54,7 +57,7 @@ def train(data, model, criterion, optimizer, epoch, args):
             n_samples = len(data) * args.batch_size
             progress = float(processed) / n_samples
             print('Train Epoch: {} [{}/{} ({:.0%})] Train loss: {}'.format(
-                epoch, processed, n_samples, progress, avg_loss))
+                epoch, processed, n_samples, progress, avg_loss), file=args.log)
             avg_loss = 0.0
 
 
@@ -63,15 +66,15 @@ def accuracy(output, target, topk=(1,)):
     maxk = max(topk)
     batch_size = target.size(0)
 
-    _, pred = output.topk(maxk, 1, True, True)
+    vals, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
     pred = pred.t()
     correct = pred.eq(target.view(1, -1).expand_as(pred))
 
     res = []
     for k in topk:
         correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-        tmp = correct_k.mul_(100.0 / batch_size)
-        res.append(tmp.data[0])
+        correct_k.mul_(100.0 / batch_size)
+        res.append(correct_k.data[0])
     return res
 
 
@@ -98,10 +101,10 @@ def evaluate(data, model, criterion, epoch, embeddings, args):
         iY = torch.autograd.Variable(iY, volatile=True)
 
         Y_hat = model(X)
-        pred = Y_hat @ embeddings.t()
+        pred = Y_hat.mm(embeddings.t())
         acc1, acc5 = accuracy(pred, iY, topk=(1, 5))
 
-        loss = criterion(Y, Y_hat).mean()
+        loss = - criterion(Y, Y_hat).mean()
         loss = loss.data[0]
 
         avg_loss += loss
@@ -111,15 +114,15 @@ def evaluate(data, model, criterion, epoch, embeddings, args):
 
         progress_bar.set_postfix(OrderedDict(
             loss='{:.2}'.format(loss),
-            acc1='{:.2}%'.format(acc1),
-            acc5='{:.2}%'.format(acc5)
+            acc1='{:g}%'.format(acc1),
+            acc5='{:g}%'.format(acc5)
         ))
 
     avg_loss /= n_samples
     avg_acc1 /= n_samples
     avg_acc5 /= n_samples
 
-    print('Test Epoch {}: Loss = {:.5} Acc@1 = {:.3}% Acc@5 = {:.3}%'.format(epoch, avg_loss, avg_acc1, avg_acc5))
+    print('Test Epoch {}: Loss = {:.5} Acc@1 = {:.3}% Acc@5 = {:.3}%'.format(epoch, avg_loss, avg_acc1, avg_acc5), file=args.log)
 
     return avg_loss
 
@@ -206,8 +209,22 @@ def main(args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-            # Start training
-    print('Training ({} epochs) is starting...'.format(args.epochs))
+    # Start training
+    if not args.run_dir:
+        run_name = '{0[arch]}_b{0[batch_size]}_lr{0[lr]}_wd{0[weight_decay]}'.format(vars(args))
+        args.run_dir = os.path.join('runs', run_name)
+
+    if not os.path.exists(args.run_dir):
+        os.makedirs(args.run_dir)
+
+    print('Train parameters:', pformat(vars(args)))
+    print('Training is starting...')
+    log_file = os.path.join(args.run_dir, 'log.txt')
+    args.log = open(log_file, 'a+')
+
+    if not args.resume:
+        print('Train parameters:', pformat(vars(args)), file=args.log)
+
     progress_bar = trange(args.start_epoch, args.epochs + 1)
     for epoch in progress_bar:
         # TRAIN
@@ -222,6 +239,7 @@ def main(args):
 
         # SAVE MODEL
         fname = '{}_epoch_{:02d}.pth'.format(args.arch, epoch)
+        fname = os.path.join(args.run_dir, fname)
         save_checkpoint({
             'epoch': epoch + 1,
             'arch': args.arch,
@@ -237,6 +255,8 @@ if __name__ == '__main__':
                         help='path to ImageNet dataset')
     parser.add_argument('embeddings',
                         help='path to ImageNet label embeddings')
+    parser.add_argument('--run_dir', '-r', metavar='DIR',
+                        help='where to save logs and snapshots')
     parser.add_argument('--arch', '-a', default='resnet18', metavar='ARCH', choices=model_names,
                         help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -246,8 +266,8 @@ if __name__ == '__main__':
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='manual epoch number (useful on restarts)')
     parser.add_argument('-b', '--batch-size', default=300, type=int, metavar='N',
-                        help='mini-batch size (default: 256)')
-    parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR',
+                        help='mini-batch size (default: 300)')
+    parser.add_argument('--lr', '--learning-rate', default=0.001, type=float, metavar='LR',
                         help='initial learning rate')
     parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar='W',
                         help='weight decay (default: 1e-4)')
