@@ -4,6 +4,7 @@ import shutil
 from collections import OrderedDict
 
 import numpy as np
+import sys
 import torch
 import torch.optim
 import torch.utils.data
@@ -27,23 +28,34 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
         shutil.copyfile(filename, best_filename)
 
 
+def adjust_learning_rate(optimizer, epoch):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    lr = args.lr * (0.1 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
 def train(data, model, criterion, optimizer, epoch, args):
     model.train()
 
     avg_loss = 0.0
     progress_bar = tqdm(data)
     for batch_idx, sample_batched in enumerate(progress_bar):
-        X, (iY, Y) = sample_batched
+        X, Y = sample_batched
+        if args.embeddings:
+            _, Y = Y  # take the target embedding from (idx, embedding) couple
+
         if args.cuda:
             X = X.cuda()
             Y = Y.cuda(async=True)
+
         X = torch.autograd.Variable(X, requires_grad=False)
         Y = torch.autograd.Variable(Y, requires_grad=False)
 
         # forward and backward pass
         optimizer.zero_grad()
         Y_hat = model(X)
-        loss = - criterion(Y, Y_hat).mean()
+        loss = criterion(Y_hat, Y).mean()
         loss.backward()
         optimizer.step()
 
@@ -57,7 +69,8 @@ def train(data, model, criterion, optimizer, epoch, args):
             n_samples = len(data) * args.batch_size
             progress = float(processed) / n_samples
             print('Train Epoch: {} [{}/{} ({:.0%})] Train loss: {}'.format(
-                epoch, processed, n_samples, progress, avg_loss), file=args.log)
+                epoch, processed, n_samples, progress, avg_loss), file=args.log,
+                flush=True)
             avg_loss = 0.0
 
 
@@ -81,9 +94,10 @@ def accuracy(output, target, topk=(1,)):
 def evaluate(data, model, criterion, epoch, embeddings, args):
     model.eval()
 
-    if args.cuda:
-        embeddings = embeddings.cuda()
-    embeddings = torch.autograd.Variable(embeddings, requires_grad=False)
+    if args.embeddings:
+        if args.cuda:
+            embeddings = embeddings.cuda()
+        embeddings = torch.autograd.Variable(embeddings, requires_grad=False)
 
     avg_acc1 = 0.0
     avg_acc5 = 0.0
@@ -91,38 +105,53 @@ def evaluate(data, model, criterion, epoch, embeddings, args):
     n_samples = 0
     progress_bar = tqdm(data)
     for batch_idx, sample_batched in enumerate(progress_bar):
-        X, (iY, Y) = sample_batched
+        X, Y = sample_batched
+
+        if args.embeddings:
+            Y, Z = Y  # Z is the target embedding
+
         if args.cuda:
             X = X.cuda()
             Y = Y.cuda(async=True)
-            iY = iY.cuda(async=True)
+
+            if args.embeddings:
+                Z = Z.cuda(async=True)
+
         X = torch.autograd.Variable(X, volatile=True)
         Y = torch.autograd.Variable(Y, volatile=True)
-        iY = torch.autograd.Variable(iY, volatile=True)
+
+        if args.embeddings:
+            Z = torch.autograd.Variable(Z, volatile=True)
 
         Y_hat = model(X)
-        pred = Y_hat.mm(embeddings.t())
-        acc1, acc5 = accuracy(pred, iY, topk=(1, 5))
 
-        loss = - criterion(Y, Y_hat).mean()
+        # compute cosine (dot-product only) against all embeddings
+        if args.embeddings:
+            Y_hat = Y_hat.mm(embeddings.t())
+
+        acc1, acc5 = accuracy(Y_hat, Y, topk=(1, 5))
+
+        target = Z if args.embeddings else Y
+        loss = criterion(Y_hat, target).mean()
         loss = loss.data[0]
 
         avg_loss += loss
         avg_acc1 += acc1
         avg_acc5 += acc5
-        n_samples += len(Y)
+        n_samples += 1
 
         progress_bar.set_postfix(OrderedDict(
-            loss='{:.2}'.format(loss),
-            acc1='{:g}%'.format(acc1),
-            acc5='{:g}%'.format(acc5)
+            loss='{:6.4f}'.format(loss),
+            acc1='{:5.2f}%'.format(acc1),
+            acc5='{:5.2f}%'.format(acc5)
         ))
 
     avg_loss /= n_samples
     avg_acc1 /= n_samples
     avg_acc5 /= n_samples
 
-    print('Test Epoch {}: Loss = {:.5} Acc@1 = {:.3}% Acc@5 = {:.3}%'.format(epoch, avg_loss, avg_acc1, avg_acc5), file=args.log)
+    print('Test Epoch {}: Loss = {:.5} Acc@1 = {:.3}% Acc@5 = {:.3}%'.format(epoch, avg_loss, avg_acc1, avg_acc5),
+          file=args.log, flush=True)
 
     return avg_loss
 
@@ -142,11 +171,6 @@ def adapt(model, embed_size, args):
 def main(args):
     # Use CUDA?
     args.cuda = torch.cuda.is_available() and not args.no_cuda
-
-    # Load Embeddings
-    print('Loading label embeddings:', args.embeddings)
-    embeddings = torch.from_numpy(np.load(args.embeddings))
-    embed_size = embeddings.shape[1]
 
     # Load ImageNet
     print('Building ImageNet dataloader:', args.data)
@@ -170,7 +194,14 @@ def main(args):
         normalize,
     ])
 
-    embed = lambda idx: (idx, embeddings[idx])
+    embed = None
+    embeddings = None
+    if args.embeddings:
+        # Load Embeddings
+        print('Loading label embeddings:', args.embeddings)
+        embeddings = torch.from_numpy(np.load(args.embeddings))
+        embed_size = embeddings.shape[1]
+        embed = lambda idx: (idx, embeddings[idx])
 
     train_dataset = datasets.ImageFolder(traindir, transform=train_transform, target_transform=embed)
     val_dataset = datasets.ImageFolder(valdir, transform=val_transform, target_transform=embed)
@@ -185,14 +216,19 @@ def main(args):
     print("Creating model: {} ({})".format(args.arch, 'pretrained' if args.pretrained else 'from scratch'))
 
     # Change the last layer to embedding regression
-    adapt(model, embed_size, args)
-    criterion = torch.nn.CosineSimilarity()
+    if args.embeddings:
+        adapt(model, embed_size, args)
+        criterion = - torch.nn.CosineSimilarity()
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
 
     if args.cuda:
         model.cuda()
         criterion = criterion.cuda()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
 
     best_loss = None
     # Optionally resume from a checkpoint
@@ -204,14 +240,23 @@ def main(args):
             best_loss = checkpoint['best_loss']
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+            if args.start_epoch < 0:
+                args.start_epoch = checkpoint['epoch']
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
+    if args.evaluate:
+        print('Evaluating on VAL set ...')
+        args.log = sys.stdout
+        evaluate(val_loader, model, criterion, args.start_epoch, embeddings, args)
+        return
+
     # Start training
     if not args.run_dir:
         run_name = '{0[arch]}_b{0[batch_size]}_lr{0[lr]}_wd{0[weight_decay]}'.format(vars(args))
+        run_name = 'cat2vec_{}'.format(run_name) if args.embeddings else run_name
         args.run_dir = os.path.join('runs', run_name)
 
     if not os.path.exists(args.run_dir):
@@ -225,8 +270,10 @@ def main(args):
     if not args.resume:
         print('Train parameters:', pformat(vars(args)), file=args.log)
 
-    progress_bar = trange(args.start_epoch, args.epochs + 1)
+    progress_bar = trange(args.start_epoch, args.epochs + 1, initial=args.start_epoch)
     for epoch in progress_bar:
+        adjust_learning_rate(optimizer, epoch)
+
         # TRAIN
         progress_bar.set_description('TRAIN')
         train(train_loader, model, criterion, optimizer, epoch, args)
@@ -248,13 +295,15 @@ def main(args):
             'optimizer': optimizer.state_dict(),
         }, is_best, fname)
 
+    args.log.close()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Cat2Vec')
     parser.add_argument('data',
                         help='path to ImageNet dataset')
-    parser.add_argument('embeddings',
-                        help='path to ImageNet label embeddings')
+    parser.add_argument('--embeddings',
+                        help='path to ImageNet label embeddings; only for cat2vec models')
     parser.add_argument('--run_dir', '-r', metavar='DIR',
                         help='where to save logs and snapshots')
     parser.add_argument('--arch', '-a', default='resnet18', metavar='ARCH', choices=model_names,
@@ -264,17 +313,21 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', default=90, type=int, metavar='N',
                         help='number of total epochs to run')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
-                        help='manual epoch number (useful on restarts)')
-    parser.add_argument('-b', '--batch-size', default=300, type=int, metavar='N',
-                        help='mini-batch size (default: 300)')
-    parser.add_argument('--lr', '--learning-rate', default=0.001, type=float, metavar='LR',
+                        help='manual epoch number (useful on custom restarts). Set to -1 to auto resume.')
+    parser.add_argument('-b', '--batch-size', default=256, type=int, metavar='N',
+                        help='mini-batch size (default: 256)')
+    parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR',
                         help='initial learning rate')
+    parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                        help='momentum')
     parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar='W',
                         help='weight decay (default: 1e-4)')
     parser.add_argument('-l', '--log-interval', default=10, type=int, metavar='N',
                         help='train iterations between logging')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to latest checkpoint (default: none)')
+    parser.add_argument('--evaluate', dest='evaluate', action='store_true',
+                        help='evaluate model on validation set')
     parser.add_argument('--pretrained', default=False, action='store_true',
                         help='use pre-trained model')
     parser.add_argument('--no-cuda', default=False, action='store_true',
