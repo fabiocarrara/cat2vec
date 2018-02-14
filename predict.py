@@ -3,13 +3,17 @@ import os
 from collections import OrderedDict
 
 import numpy as np
+import pandas as pd
 import torch
+import torch.nn.functional as F
 import torch.optim
 import torch.utils.data
-import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
 
+from glob2 import glob as glob
+from torch.utils.data import Dataset
+from torchvision.datasets.folder import default_loader
 from tqdm import tqdm
 
 # Available PyTorch models for ImageNet
@@ -18,124 +22,71 @@ model_names = sorted(name for name in models.__dict__
                      and callable(models.__dict__[name]))
 
 
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy@k for the specified values of k"""
-    maxk = max(topk)
-    batch_size = target.size(0)
+class ImageListDataset(Dataset):
+    def __init__(self, paths, transform=None):
+        self.paths = paths
+        self.transform = transform
 
-    vals, pred = output.topk(maxk, dim=1, largest=True, sorted=True)
-    pred = pred.t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
+    def __len__(self):
+        return len(self.paths)
 
-    res = []
-    for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-        correct_k.mul_(100.0 / batch_size)
-        res.append(correct_k.data[0])
-    return res
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = default_loader(path)
+
+        if self.transform:
+            img = self.transform(img)
+
+        return img
 
 
-def evaluate_cosine(data, model, embeddings, args):
-    criterion = torch.nn.CosineSimilarity()
+def predict(data, model, args):
+    model.eval()
 
     if args.cuda:
         model.cuda()
-        criterion = criterion.cuda()
-        embeddings = embeddings.cuda()
 
-    embeddings = torch.autograd.Variable(embeddings, requires_grad=False)
-
-    model.eval()
-
-    avg_acc1 = 0.0
-    avg_acc5 = 0.0
-    avg_loss = 0.0
-    n_samples = 0
+    predictions = []
     progress_bar = tqdm(data)
     for batch_idx, sample_batched in enumerate(progress_bar):
-        X, (iY, Y) = sample_batched
+        X = sample_batched
         if args.cuda:
             X = X.cuda()
-            Y = Y.cuda(async=True)
-            iY = iY.cuda(async=True)
         X = torch.autograd.Variable(X, volatile=True)
-        Y = torch.autograd.Variable(Y, volatile=True)
-        iY = torch.autograd.Variable(iY, volatile=True)
 
         Y_hat = model(X)
-        pred = Y_hat.mm(embeddings.t())
-
-        acc1, acc5 = accuracy(pred, iY, topk=(1, 5))
-
-        loss = - criterion(Y, Y_hat).mean()
-        loss = loss.data[0]
-
-        avg_loss += loss
-        avg_acc1 += acc1
-        avg_acc5 += acc5
-        n_samples += 1
-
-        progress_bar.set_postfix(OrderedDict(
-            loss='{:6.4f}'.format(loss),
-            acc1='{:5.2f}%'.format(acc1),
-            acc5='{:5.2f}%'.format(acc5)
-        ))
-
-    avg_loss /= n_samples
-    avg_acc1 /= n_samples
-    avg_acc5 /= n_samples
-
-    print('Loss = {:6.4f} Acc@1 = {:6.3f}% Acc@5 = {:6.3f}%'.format(avg_loss, avg_acc1, avg_acc5))
-
-    return avg_loss
+        Y_hat = F.normalize(Y_hat.data, p=2, dim=1)
+        predictions.append(Y_hat.cpu())
+        
+    return torch.cat(predictions, dim=0)
 
 
-def evaluate(data, model, args):
-    criterion = torch.nn.CrossEntropyLoss()
+def find_nearest_embeddings(predictions, embeddings, k=5):
+#    if args.cuda:
+#        embeddings = embeddings.cuda()
+#        predictions = predictions.cuda()
 
-    if args.cuda:
-        model.cuda()
-        criterion = criterion.cuda()
+    # Embeddings should be already L2-normalized -- if not
+    # uncomment the following line.
+    # embeddings = F.normalize(embeddings, p=2, dim=1)
 
-    model.eval()
+    scores = predictions.mm(embeddings.t())
+    S, I = scores.topk(k, dim=1, largest=True, sorted=True)
 
-    avg_acc1 = 0.0
-    avg_acc5 = 0.0
-    avg_loss = 0.0
-    n_samples = 0
-    progress_bar = tqdm(data)
-    for batch_idx, sample_batched in enumerate(progress_bar):
-        X, Y = sample_batched
-        if args.cuda:
-            X = X.cuda()
-            Y = Y.cuda(async=True)
-        X = torch.autograd.Variable(X, volatile=True)
-        Y = torch.autograd.Variable(Y, volatile=True)
+    return S, I
 
-        Y_hat = model(X)
-        acc1, acc5 = accuracy(Y_hat, Y, topk=(1, 5))
 
-        loss = criterion(Y_hat, Y).mean()
-        loss = loss.data[0]
+def compare_predictions(S, I, S2, I2):
+    pass
+    # for path, score, idx in zip(urls, S, I):
+    #     print(path)
+    #     print('-----')
+    #     for s, i in zip(score, idx):
+    #         print('{}: {} ({})'.format(s, dictionary[i], i))
+    #         # predictions.append([path, s, dictionary[i], i])
 
-        avg_loss += loss
-        avg_acc1 += acc1
-        avg_acc5 += acc5
-        n_samples += 1
-
-        progress_bar.set_postfix(OrderedDict(
-            loss='{:6.4f}'.format(loss),
-            acc1='{:5.2f}%'.format(acc1),
-            acc5='{:5.2f}%'.format(acc5)
-        ))
-
-    avg_loss /= n_samples
-    avg_acc1 /= n_samples
-    avg_acc5 /= n_samples
-
-    print('Loss = {:6.4f} Acc@1 = {:6.3f}% Acc@5 = {:6.3f}%'.format(avg_loss, avg_acc1, avg_acc5))
-
-    return avg_loss
+    # results = pd.DataFrame().from_records(predictions)
+    # results.to_csv('predictions.csv')
 
 
 def adapt(model, embed_size, args):
@@ -163,51 +114,109 @@ def main(args):
         normalize,
     ])
 
-    embed = None
-    if args.embeddings:
-        # Load Embeddings
-        print('Loading label embeddings:', args.embeddings)
-        embeddings = torch.from_numpy(np.load(args.embeddings))
-        embed_size = embeddings.shape[1]
-        embed = lambda idx: (idx, embeddings[idx])
+    # Load Embeddings
+    dictionary_filename = args.embeddings.replace('.npy', '.txt')
+    assert os.path.isfile(dictionary_filename), "Dictionary file not found: {}".format(dictionary_filename)
+    print('Loading dictionary:', dictionary_filename)
+    dictionary = np.array([line.rstrip() for line in open(dictionary_filename, 'rt')])
 
-    # Load folder (e.g: ImageNet)
-    print('Building dataloader:', args.data)
-    dataset = datasets.ImageFolder(args.data, transform=val_transform, target_transform=embed)
+    print('Loading label embeddings:', args.embeddings)
+    embeddings = torch.from_numpy(np.load(args.embeddings))
+    embed_size = embeddings.shape[1]
+    embed = lambda idx: (idx, embeddings[idx])
+
+    # Load images (flatten folder)
+
+    def find_images(path):
+        images = []
+        for ext in ('jpg', 'jpeg', 'gif', 'png'):
+            pattern = os.path.join(path, '**/*.{}'.format(ext))
+            images.extend(glob(pattern))
+        return images
+
+    urls = [find_images(i) if os.path.isdir(i) else (i,) for i in args.data]
+    urls = [item for list in urls for item in list]  # flatten out dirs
+
+    print('Image found: {}'.format(len(urls)))
+    dataset = ImageListDataset(urls, transform=val_transform)
     loader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=False,
                                          num_workers=args.workers)
     # Create model
-    pretrained = args.embeddings is None
-    model = models.__dict__[args.arch](pretrained=pretrained)
-    snapshot = 'pretrained' if pretrained else args.checkpoint if args.checkpoint else 'from-scratch'
-    print("Creating model: {} ({})".format(args.arch, snapshot))
+    model = models.__dict__[args.arch]()
+    print("Creating model: {} ({})".format(args.arch, args.checkpoint))
 
-    if args.embeddings:
-        # Change the last layer to embedding regression
-        adapt(model, embed_size, args)
-        assert os.path.isfile(args.checkpoint), "Checkpoint file not found: {}".format(args.checkpoint)
-        checkpoint = torch.load(args.checkpoint, map_location=lambda storage, loc: storage)
-        model.load_state_dict(checkpoint['state_dict'])
-        evaluate_cosine(loader, model, embeddings, args)
+    # Change the last layer to embedding regression
+    adapt(model, embed_size, args)
+    assert os.path.isfile(args.checkpoint), "Checkpoint file not found: {}".format(args.checkpoint)
+    checkpoint = torch.load(args.checkpoint, map_location=lambda storage, loc: storage)
+    model.load_state_dict(checkpoint['state_dict'])
+    predicted_embeds = predict(loader, model, args)
+    
+
+    if args.output:
+        out_fname = args.output if args.output.endswith('.npy') else '{}.npy'.format(args.output)
+        np.save(out_fname, predicted_embeds.numpy())
+
+    del model
+    torch.cuda.empty_cache()
+
+    # DEBUG: also print ILSVRC12 nearest embedding
+    i_dictionary = np.array([line.rstrip() for line in open('ilsvrc12_cat_embeds_l2norm.txt')])
+    i_embeddings = torch.from_numpy(np.load('ilsvrc12_cat_embeds_l2norm.npy'))
+
+    top_scores, top_indexes = find_nearest_embeddings(predicted_embeds, embeddings, k=5)
+    i_top_scores, i_top_indexes = find_nearest_embeddings(predicted_embeds, i_embeddings, k=5)
+
+    top1_embeds = embeddings[top_indexes[:, 0]]
+    i_top1_embeds = i_embeddings[i_top_indexes[:, 0]]
+    
+    top1_labels = dictionary[top_indexes[:, 0]]
+    i_top1_labels = i_dictionary[i_top_indexes[:, 0]]
+
+    top1_labels_similarity = torch.sum(top1_embeds * i_top1_embeds, dim=1)
+
+    results = {
+        'URL': urls,
+        'GoogleNewsScore': top_scores[:, 0],
+        'GoogleNewsPrediction': top1_labels,
+        'GoogleNewsEmbIdx': top_indexes[:, 0],
+        'ILSVRC12Score': i_top_scores[:, 0],
+        'ILSVRC12Prediction': i_top1_labels,
+        'ILSVRC12EmbIdx': i_top_indexes[:, 0],
+        'LabelCosineSimilarity': top1_labels_similarity
+    }
+
+    results = pd.DataFrame(results)
+    if args.output:
+        out_fname = args.output if args.output.endswith('.csv') else '{}.csv'.format(args.output)
+        results.to_csv(out_fname, index=False)
     else:
-        evaluate(loader, model, args)
+        print (results)
+
+    # for path, score, idx, i_score, i_idx in zip(urls, top_scores, top_indexes, i_top_scores, i_top_indexes):
+    #     print(path)
+    #     print('-----')
+    #     for s, i, si, ii in zip(score, idx, i_score, i_idx):  # iterate over top-K scores
+    #         print('{}: {} ({}) \t {}: {} ({})'.format(s, dictionary[i], i, si, i_dictionary[ii], ii))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Cat2Vec Prediction')
 
-    parser.add_argument('data',
-                        help='path to folder with images')
+    parser.add_argument('data', nargs='+',
+                        help='input images')
+    parser.add_argument('-o', '--output',
+                        help='where to store predicted embeddings')
+    parser.add_argument('-e', '--embeddings',
+                        help='path to target embeddings; only for label prediction with cosine similarity')
     parser.add_argument('-c', '--checkpoint',
                         help='path to model checkpoint; only for cat2vec models')
-    parser.add_argument('-e', '--embeddings',
-                        help='path to ImageNet label embeddings; only for vat2vec models')
     parser.add_argument('--arch', '-a', default='resnet18', metavar='ARCH', choices=model_names,
                         help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet18)')
     parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                        help='number of data loading workers if given data is a folder (default: 4)')
-    parser.add_argument('-b', '--batch-size', default=300, type=int, metavar='N',
-                        help='mini-batch size (default: 300)')
+                        help='number of data loading workers (default: 4)')
+    parser.add_argument('-b', '--batch-size', default=256, type=int, metavar='N',
+                        help='mini-batch size (default: 256)')
     parser.add_argument('--no-cuda', default=False, action='store_true',
                         help='do not use CUDA acceleration')
     args = parser.parse_args()
