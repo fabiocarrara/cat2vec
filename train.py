@@ -7,6 +7,7 @@ import numpy as np
 import sys
 import torch
 import torch.optim
+import torch.nn as nn
 import torch.utils.data
 import torchvision.datasets as datasets
 import torchvision.models as models
@@ -18,6 +19,16 @@ from tqdm import tqdm, trange
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
+
+
+class CosineDistance(nn.Module):
+    def __init__(self, dim=1, eps=1e-8):
+        super(CosineDistance, self).__init__()
+        self.dim = dim
+        self.eps = eps
+
+    def forward(self, x1, x2):
+        return - nn.functional.cosine_similarity(x1, x2, self.dim, self.eps)
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
@@ -125,15 +136,15 @@ def evaluate(data, model, criterion, epoch, embeddings, args):
 
         Y_hat = model(X)
 
+        target = Z if args.embeddings else Y
+        loss = criterion(Y_hat, target).mean()
+        loss = loss.data[0]
+
         # compute cosine (dot-product only) against all embeddings
         if args.embeddings:
             Y_hat = Y_hat.mm(embeddings.t())
 
         acc1, acc5 = accuracy(Y_hat, Y, topk=(1, 5))
-
-        target = Z if args.embeddings else Y
-        loss = criterion(Y_hat, target).mean()
-        loss = loss.data[0]
 
         avg_loss += loss
         avg_acc1 += acc1
@@ -157,15 +168,46 @@ def evaluate(data, model, criterion, epoch, embeddings, args):
 
 
 def adapt(model, embed_size, args):
+
+    if args.fix_weights:
+        for param in model.parameters():
+            param.requires_grad = False
+            
+    def make_new_layers(I, E, N):
+        assert N >= 1 and type(N) is int, "N must be an integer >= 1"
+        
+        if N == 1:
+            return nn.Linear(I, E)
+            
+        if N == 2:
+            M = round((I * 1000) / (I + E))
+            return nn.Sequential(nn.Linear(I, M), nn.ReLU(), nn.Linear(M, E))
+            
+        # CASE N > 2:
+        # I*M + (N-2)*(M*M) + M*E = I * 1000, solve for M:
+        M = round((np.sqrt( (I + E)**2 + 4*(N-2)*1000*I ) - (I + E)) / (2*(N-2)))
+        new_layers = [nn.Linear(I, M), nn.ReLU()]
+        for _ in range(N-2):
+            new_layers.extend([nn.Linear(M, M), nn.ReLU()])
+        new_layers.append(nn.Linear(M, E))
+        
+        return nn.Sequential(*new_layers)
+            
+
     if 'resnet' in args.arch or 'inception' in args.arch:
         in_size = model.fc.in_features
-        model.fc = torch.nn.Linear(in_size, embed_size)
-    elif 'densenet' in args.arch:
+        model.fc = make_new_layers(in_size, embed_size, args.new_layers)
+        return model.fc
+        
+    if 'densenet' in args.arch:
         in_size = model.classifier.in_features
-        model.classifier = torch.nn.Linear(in_size, embed_size)
-    elif 'alexnet' in args.arch or 'vgg' in args.arch:
+        model.classifier = make_new_layers(in_size, embed_size, args.new_layers)
+        return model.classifier
+        
+    if 'alexnet' in args.arch or 'vgg' in args.arch:
         in_size = model.classifier[-1].in_features
-        model.classifier[-1] = torch.nn.Linear(in_size, embed_size)
+        model.classifier[-1] = make_new_layers(in_size, embed_size, args.new_layers)
+        return model.classifier[-1]
 
 
 def main(args):
@@ -215,10 +257,13 @@ def main(args):
     model = models.__dict__[args.arch](pretrained=args.pretrained)
     print("Creating model: {} ({})".format(args.arch, 'pretrained' if args.pretrained else 'from scratch'))
 
+    trained_params = model.parameters()
     # Change the last layer to embedding regression
     if args.embeddings:
-        adapt(model, embed_size, args)
-        criterion = - torch.nn.CosineSimilarity()
+        last_layer = adapt(model, embed_size, args)
+        criterion = CosineDistance()
+        if args.fix_weights:
+            trained_params = last_layer.parameters()
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
@@ -226,9 +271,14 @@ def main(args):
         model.cuda()
         criterion = criterion.cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
+    # Choose optimizer
+    if args.optimizer == 'sgd':
+        optimizer = torch.optim.SGD(trained_params, lr=args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay)
+    elif args.optimizer == 'adam':
+        optimizer = torch.optim.Adam(trained_params, lr=args.lr,
+                                    weight_decay=args.weight_decay)
 
     best_loss = None
     # Optionally resume from a checkpoint
@@ -255,7 +305,9 @@ def main(args):
 
     # Start training
     if not args.run_dir:
-        run_name = '{0[arch]}_b{0[batch_size]}_lr{0[lr]}_wd{0[weight_decay]}'.format(vars(args))
+        run_name = '{0[arch]}_b{0[batch_size]}_lr{0[lr]}_wd{0[weight_decay]}_optim{0[optimizer]}_nl{0[new_layers]}'.format(vars(args))
+        run_name = 'pretrained_{}'.format(run_name) if args.pretrained else run_name
+        run_name = 'fixed_{}'.format(run_name) if args.fix_weights else run_name
         run_name = 'cat2vec_{}'.format(run_name) if args.embeddings else run_name
         args.run_dir = os.path.join('runs', run_name)
 
@@ -316,8 +368,10 @@ if __name__ == '__main__':
                         help='manual epoch number (useful on custom restarts). Set to -1 to auto resume.')
     parser.add_argument('-b', '--batch-size', default=256, type=int, metavar='N',
                         help='mini-batch size (default: 256)')
+    parser.add_argument('-o', '--optimizer', default='adam', metavar='OPTIM', choices=['sgd', 'adam'],
+                        help='optimizer: sgd | adam (default: sgd)')
     parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR',
-                        help='initial learning rate')
+                        help='initial learning rate (default: 0.1)')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                         help='momentum')
     parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar='W',
@@ -330,6 +384,10 @@ if __name__ == '__main__':
                         help='evaluate model on validation set')
     parser.add_argument('--pretrained', default=False, action='store_true',
                         help='use pre-trained model')
+    parser.add_argument('--fix-weights', default=False, action='store_true',
+                        help='whether to fix the weights of the pre-trained part of the model')
+    parser.add_argument('--new-layers', default=1, type=int, metavar='N',
+                        help='new layers dedicated to embedding regression (default: 1, i.e. only the projection to the embeddings)')
     parser.add_argument('--no-cuda', default=False, action='store_true',
                         help='do not use CUDA acceleration')
     args = parser.parse_args()
