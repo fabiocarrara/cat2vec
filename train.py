@@ -371,7 +371,7 @@ if __name__ == '__main__':
                         help='manual epoch number (useful on custom restarts). Set to -1 to auto resume.')
     parser.add_argument('-b', '--batch-size', default=256, type=int, metavar='N',
                         help='mini-batch size (default: 256)')
-    parser.add_argument('-o', '--optimizer', default='adam', metavar='OPTIM', choices=['sgd', 'adam'],
+    parser.add_argument('-o', '--optimizer', default='sgd', metavar='OPTIM', choices=['sgd', 'adam'],
                         help='optimizer: sgd | adam (default: sgd)')
     parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR',
                         help='initial learning rate (default: 0.1)')
