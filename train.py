@@ -5,6 +5,10 @@ from collections import OrderedDict
 
 import numpy as np
 import sys
+import PIL
+from PIL import Image
+
+PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torch
 import torch.optim
 import torch.nn as nn
@@ -236,6 +240,15 @@ def main(args):
         normalize,
     ])
 
+    # def pil_loader(path):
+    #     # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+    #     try:
+    #         with open(path, 'rb') as f:
+    #             with Image.open(f) as img:
+    #                 return img.convert('RGB')
+    #     except:
+    #         pass
+
     embed = None
     embeddings = None
     if args.embeddings:
@@ -245,8 +258,8 @@ def main(args):
         embed_size = embeddings.shape[1]
         embed = lambda idx: (idx, embeddings[idx])
 
-    train_dataset = datasets.ImageFolder(traindir, transform=train_transform, target_transform=embed)
-    val_dataset = datasets.ImageFolder(valdir, transform=val_transform, target_transform=embed)
+    train_dataset = datasets.ImageFolder(traindir, transform=train_transform, target_transform=embed)#, loader=pil_loader)
+    val_dataset = datasets.ImageFolder(valdir, transform=val_transform, target_transform=embed)#, loader=pil_loader)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                                num_workers=args.workers, pin_memory=True)
@@ -376,7 +389,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR',
                         help='initial learning rate (default: 0.1)')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                        help='momentum')
+                        help='momentum (default: 0.9)')
     parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar='W',
                         help='weight decay (default: 1e-4)')
     parser.add_argument('-l', '--log-interval', default=10, type=int, metavar='N',
