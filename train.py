@@ -289,7 +289,10 @@ def main(args):
             args.start_epoch = checkpoint['epoch']
             best_loss = checkpoint['best_loss']
             model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+            except:
+                print('WARNING: mismatching optimizer state, using a pristine optimizer..')
             if args.start_epoch < 0:
                 args.start_epoch = checkpoint['epoch']
             print("=> loaded checkpoint '{}' (epoch {})"
