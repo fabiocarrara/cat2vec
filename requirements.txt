@@ -9,6 +9,6 @@ scikit-learn==0.19.1
 scipy==1.0.0
 six==1.11.0
 sklearn==0.0
-torch==0.3.0.post4
+torch==0.3.1
 torchvision==0.2.0
 tqdm==4.19.5
