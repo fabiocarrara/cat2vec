@@ -5,10 +5,8 @@ from collections import OrderedDict
 
 import numpy as np
 import sys
-import PIL
-from PIL import Image
-
-PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torch
 import torch.optim
 import torch.nn as nn
